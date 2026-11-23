@@ -1,0 +1,181 @@
+---
+- name: Install RabbitMQ and configure the lab cluster
+  hosts: rabbitmq
+  become: true
+  any_errors_fatal: true
+  vars:
+    seed: "{{ groups['rabbitmq'][0] }}"
+    broker: netology-rabbitmq
+    image: rabbitmq:3.13-management@sha256:e582c0bc7766f3342496d8485efb5a1df782b5ce3886ad017e2eaae442311f69
+    config_path: /opt/netology-rabbitmq
+    host_entries: >-
+      {{ groups['rabbitmq'] | zip(groups['rabbitmq'] | map('extract', hostvars, 'ansible_host'))
+      | map('join', ':') | list }}
+    policy_definition:
+      ha-mode: all
+      ha-sync-mode: automatic
+  tasks:
+    - name: Require shared cluster credentials
+      ansible.builtin.assert:
+        that:
+          - rabbitmq_erlang_cookie | default('') is match('^[0-9a-f]{48}$')
+          - rabbitmq_password | default('') is match('^[0-9a-f]{36}$')
+      no_log: true
+
+    - name: Install Docker
+      ansible.builtin.apt:
+        name: docker.io
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Start Docker
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Resolve all nodes on each VM
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[item].ansible_host }} {{ item }}"
+      loop: "{{ groups['rabbitmq'] }}"
+
+    - name: Create private configuration directory
+      ansible.builtin.file:
+        path: "{{ config_path }}"
+        state: directory
+        mode: '0700'
+
+    - name: Write broker environment for initial deployment
+      ansible.builtin.copy:
+        dest: "{{ config_path }}/broker.env"
+        mode: '0600'
+        force: false
+        content: |
+          RABBITMQ_ERLANG_COOKIE={{ rabbitmq_erlang_cookie }}
+          RABBITMQ_DEFAULT_USER=netology
+          RABBITMQ_DEFAULT_PASS={{ rabbitmq_password }}
+      no_log: true
+
+    - name: Check for an existing lab container
+      ansible.builtin.command: "docker container inspect {{ broker }}"
+      register: existing_broker
+      changed_when: false
+      failed_when: existing_broker.rc != 0 and 'No such container' not in existing_broker.stderr
+      no_log: true
+
+    - name: Deploy RabbitMQ Management with a persistent volume
+      ansible.builtin.command:
+        argv: >-
+          {{ ['docker', 'run', '-d', '--name', broker, '--restart', 'unless-stopped',
+              '--network', 'host', '--hostname', inventory_hostname,
+              '--env-file', config_path ~ '/broker.env',
+              '-v', broker ~ ':/var/lib/rabbitmq']
+             + (host_entries | map('regex_replace', '^', '--add-host=') | list) + [image] }}
+      when: existing_broker.rc != 0
+
+    - name: Start the existing container if stopped
+      ansible.builtin.command: "docker container start {{ broker }}"
+      when: existing_broker.rc == 0 and not (existing_broker.stdout | from_json | first).State.Running
+
+    - name: Resolve inventory nodes inside every RabbitMQ container
+      ansible.builtin.command:
+        argv:
+          - docker
+          - exec
+          - --user
+          - "0"
+          - "{{ broker }}"
+          - sh
+          - -ec
+          - |
+            if ! awk -v ip="$2" -v host="$3" '$1 == ip && $2 == host { found = 1 } END { exit !found }' /etc/hosts; then
+              printf '%s\n' "$1" >> /etc/hosts
+              echo added
+            fi
+          - --
+          - "{{ hostvars[item].ansible_host }} {{ item }}"
+          - "{{ hostvars[item].ansible_host }}"
+          - "{{ item }}"
+      loop: "{{ groups['rabbitmq'] }}"
+      register: broker_hosts
+      changed_when: "'added' in broker_hosts.stdout_lines"
+
+    - name: Wait for the broker application
+      ansible.builtin.command: "docker exec {{ broker }} rabbitmq-diagnostics -q check_running"
+      register: rabbitmq_ready
+      changed_when: false
+      until: rabbitmq_ready.rc == 0
+      retries: 30
+      delay: 2
+
+    - name: Inspect local cluster membership
+      ansible.builtin.command: "docker exec {{ broker }} rabbitmqctl cluster_status --formatter json"
+      register: membership
+      changed_when: false
+
+    - name: Join non-member nodes to the seed
+      when:
+        - inventory_hostname != seed
+        - ('rabbit@' ~ seed) not in (membership.stdout | from_json).disk_nodes
+      throttle: 1
+      block:
+        - name: Confirm the joining node is standalone
+          ansible.builtin.assert:
+            that:
+              - (membership.stdout | from_json).disk_nodes == ['rabbit@' ~ inventory_hostname]
+              - (membership.stdout | from_json).ram_nodes | length == 0
+
+        - name: List queues before joining
+          ansible.builtin.command: "docker exec {{ broker }} rabbitmqctl list_queues --quiet --formatter json name"
+          register: local_queues
+          changed_when: false
+
+        - name: Require an empty joining node
+          ansible.builtin.assert:
+            that: (local_queues.stdout | from_json) | length == 0
+
+        - name: Stop the application on the joining node
+          ansible.builtin.command: "docker exec {{ broker }} rabbitmqctl stop_app"
+
+        - name: Join the seed and restart the application
+          block:
+            - name: Join the seed
+              ansible.builtin.command: "docker exec {{ broker }} rabbitmqctl join_cluster rabbit@{{ seed }}"
+          always:
+            - name: Restart the application on the joining node
+              ansible.builtin.command: "docker exec {{ broker }} rabbitmqctl start_app"
+
+    - name: Manage the replicated queue policy on the seed
+      run_once: true
+      delegate_to: "{{ seed }}"
+      block:
+        - name: Read broker policies
+          ansible.builtin.command: "docker exec {{ broker }} rabbitmqctl list_policies --formatter json"
+          register: policies
+          changed_when: false
+
+        - name: Set ha-all on all queues
+          vars:
+            current_definition: >-
+              {{ policies.stdout | from_json
+                 | selectattr('vhost', 'equalto', '/')
+                 | selectattr('name', 'equalto', 'ha-all')
+                 | selectattr('pattern', 'equalto', '.*')
+                 | selectattr('apply-to', 'equalto', 'queues')
+                 | selectattr('priority', 'equalto', 0)
+                 | map(attribute='definition') | first | default('{}') | from_json }}
+          ansible.builtin.command:
+            argv:
+              - docker
+              - exec
+              - "{{ broker }}"
+              - rabbitmqctl
+              - set_policy
+              - --apply-to
+              - queues
+              - ha-all
+              - '.*'
+              - "{{ policy_definition | to_json }}"
+          when: current_definition != policy_definition
